@@ -56,11 +56,9 @@ async function readGoogle() {
       .filter((o) => o.price && o.leg);
 
   // espera os resultados de ida (até 40 s: no servidor a página pode demorar)
-  const semVoo = () => /Nenhum resultado|Nenhuma opção|não encontramos voos|No results/i.test(document.body?.innerText ?? '');
   let outs = options();
   for (let i = 0; i < 80 && !outs.length; i++) {
     if (location.pathname.startsWith('/sorry')) return { blocked: true };
-    if (semVoo()) return { price: null, semVoo: true };
     await wait(500);
     outs = options();
   }
@@ -120,7 +118,6 @@ const flush = (force = false) => {
 
 let blocked = false;
 const fila = [...pairs];
-const segunda = []; // datas que não carregaram: tentam de novo no fim
 const tentativas = new Map();
 async function trabalhador(n) {
   const page = await ctx.newPage();
@@ -148,14 +145,14 @@ async function trabalhador(n) {
       break;
     }
     pend.q++;
-    // só considera "conferida" quando a página carregou de verdade (não apaga preço por falha de carregamento)
-    if (result && !result.error && !result.timeout) pend.checked.push(p);
+    // só conta como "conferida" (e troca o preço antigo) quando achou preço de verdade
+    if (result?.price) pend.checked.push(p);
     if (result?.price) {
       st.found++;
       pend.fares.push({ dep: p.dep, ret: p.ret, price: result.price, airline: result.airline, stops: result.out?.stops ?? null, link: url, info: { out: result.out, back: result.back } });
     }
     st.done++;
-    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price : result?.semVoo ? 'sem voo' : result?.timeout ? 'não carregou' : 'sem preço'}${result?.back ? '' : result?.price ? ' (sem volta)' : ''}`);
+    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price : 'não carregou'}${result?.back ? '' : result?.price ? ' (sem volta)' : ''}`);
     progress();
     flush();
   }
