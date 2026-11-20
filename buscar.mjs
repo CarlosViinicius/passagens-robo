@@ -4,7 +4,7 @@ import { chromium } from 'playwright';
 
 const APP_URL = (process.env.APP_URL || 'https://passagens-chile.baudelaire-aviso.workers.dev').replace(/\/+$/, '');
 const EXT_KEY = process.env.EXT_KEY;
-const PARALELO = Number(process.env.PARALELO || 4); // quantas datas ao mesmo tempo
+const PARALELO = Number(process.env.PARALELO || 3); // quantas datas ao mesmo tempo
 const LOTE = 10; // manda para o app a cada 10 datas conferidas
 if (!EXT_KEY) throw new Error('Falta o segredo EXT_KEY no GitHub (Settings > Secrets and variables > Actions).');
 
@@ -55,21 +55,24 @@ async function readGoogle() {
       .map((el) => ({ el, ...parse(el.getAttribute('aria-label')) }))
       .filter((o) => o.price && o.leg);
 
-  // espera os resultados de ida
+  // espera os resultados de ida (até 40 s: no servidor a página pode demorar)
+  const semVoo = () => /Nenhum resultado|Nenhuma opção|não encontramos voos|No results/i.test(document.body?.innerText ?? '');
   let outs = options();
-  for (let i = 0; i < 50 && !outs.length; i++) {
-    await wait(300);
+  for (let i = 0; i < 80 && !outs.length; i++) {
+    if (location.pathname.startsWith('/sorry')) return { blocked: true };
+    if (semVoo()) return { price: null, semVoo: true };
+    await wait(500);
     outs = options();
   }
-  if (!outs.length) return { price: null };
+  if (!outs.length) return { price: null, timeout: true, page: (document.title + ' | ' + (document.body?.innerText ?? '')).replace(/\s+/g, ' ').slice(0, 220) };
   const best = outs.reduce((a, b) => (b.price < a.price ? b : a));
   const firstText = best.el.getAttribute('aria-label');
 
   // abre a ida mais barata para ver as voltas
   best.el.click();
   let backs = [];
-  for (let i = 0; i < 50 && !backs.length; i++) {
-    await wait(300);
+  for (let i = 0; i < 60 && !backs.length; i++) {
+    await wait(500);
     backs = options().filter((o) => o.el.getAttribute('aria-label') !== firstText && /Maringá/.test(o.el.getAttribute('aria-label').split('chega no aeroporto')[1] ?? ''));
   }
   const back = backs.length ? backs.reduce((a, b) => (b.price < a.price ? b : a)) : null;
@@ -117,6 +120,8 @@ const flush = (force = false) => {
 
 let blocked = false;
 const fila = [...pairs];
+const segunda = []; // datas que não carregaram: tentam de novo no fim
+const tentativas = new Map();
 async function trabalhador(n) {
   const page = await ctx.newPage();
   await sleep(n * 1500); // começa um pouco espaçado
@@ -124,13 +129,18 @@ async function trabalhador(n) {
     const p = fila.shift();
     const url = flightsUrl(p.dep, p.ret);
     let result = null;
-    for (let tent = 0; tent < 2 && !result; tent++) {
-      try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        result = await page.evaluate(readGoogle);
-      } catch (e) {
-        console.log(`  erro em ${p.dep} → ${p.ret}: ${e.message.split('\n')[0]}`);
-      }
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      result = await page.evaluate(readGoogle);
+    } catch (e) {
+      result = { timeout: true, page: e.message.split('\n')[0] };
+    }
+    const k = `${p.dep}|${p.ret}`;
+    if (result?.timeout && (tentativas.get(k) ?? 0) < 2) {
+      tentativas.set(k, (tentativas.get(k) ?? 0) + 1);
+      console.log(`   … ${p.dep} → ${p.ret} não carregou, tenta de novo no fim (${result.page})`);
+      fila.push(p);
+      continue;
     }
     if (result?.blocked) {
       blocked = true;
@@ -138,13 +148,14 @@ async function trabalhador(n) {
       break;
     }
     pend.q++;
-    if (result && !result.error) pend.checked.push(p);
+    // só considera "conferida" quando a página carregou de verdade (não apaga preço por falha de carregamento)
+    if (result && !result.error && !result.timeout) pend.checked.push(p);
     if (result?.price) {
       st.found++;
       pend.fares.push({ dep: p.dep, ret: p.ret, price: result.price, airline: result.airline, stops: result.out?.stops ?? null, link: url, info: { out: result.out, back: result.back } });
     }
     st.done++;
-    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price : 'sem preço'}${result?.back ? '' : result?.price ? ' (sem volta)' : ''}`);
+    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price : result?.semVoo ? 'sem voo' : result?.timeout ? 'não carregou' : 'sem preço'}${result?.back ? '' : result?.price ? ' (sem volta)' : ''}`);
     progress();
     flush();
   }
