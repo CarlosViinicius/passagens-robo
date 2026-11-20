@@ -1,0 +1,49 @@
+name: Buscar passagens
+
+on:
+  schedule:
+    # 08h, 10h, 12h, 14h, 16h, 18h, 20h, 22h e 00h no horário de Brasília (UTC-3)
+    - cron: '7 11,13,15,17,19,21,23,1,3 * * *'
+  workflow_dispatch: # botão "Run workflow" para buscar na hora
+
+concurrency:
+  group: buscar
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  buscar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Instalar o Chrome invisível
+        run: npx playwright install --with-deps --only-shell chromium
+      - name: Buscar no Google Voos
+        run: node buscar.mjs
+        env:
+          EXT_KEY: ${{ secrets.EXT_KEY }}
+          APP_URL: ${{ vars.APP_URL }}
+
+  # O GitHub desliga horários agendados depois de 60 dias sem mudanças no repositório.
+  # Isto faz uma alteração vazia uma vez por mês para manter tudo ligado.
+  manter-ligado:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 30 * 86400 )) ]; then
+            git config user.name "robo-passagens"
+            git config user.email "robo@users.noreply.github.com"
+            git commit --allow-empty -m "Mantém o agendamento ligado"
+            git push
+          fi

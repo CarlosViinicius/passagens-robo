@@ -1,0 +1,7 @@
+{
+  "name": "passagens-robo",
+  "private": true,
+  "type": "module",
+  "scripts": { "buscar": "node buscar.mjs" },
+  "dependencies": { "playwright": "^1.65.1" }
+}
