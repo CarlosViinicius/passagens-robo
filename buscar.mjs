@@ -1,14 +1,17 @@
-// Robô do GitHub: abre o Google Voos num Chrome invisível, lê o menor preço de cada combinação de datas
-// (com horários de ida e volta) e manda para o app. Várias datas ao mesmo tempo, sem imagens nem fontes.
+// Robô do GitHub: abre o Google Voos num Chrome nos servidores do GitHub, lê o voo mais barato de cada
+// combinação de datas (ida e volta, com horários) e manda para o app.
+// Pode demorar, mas não desiste: cada data tenta várias vezes, e a tela das voltas é recarregada
+// sozinha (sem recomeçar a data) até aparecerem os voos de volta.
 import { chromium } from 'playwright';
 
 const APP_URL = (process.env.APP_URL || 'https://passagens-chile.baudelaire-aviso.workers.dev').replace(/\/+$/, '');
 const EXT_KEY = process.env.EXT_KEY;
-const PARALELO = Number(process.env.PARALELO || 1); // quantas datas ao mesmo tempo
-const LOTE = 5;
-// Divisão entre vários servidores do GitHub (cada um com outro endereço de internet): este faz a parte SHARD de SHARDS
+const LOTE = 3; // manda para o app a cada 3 datas
+const MAX_TENTATIVAS = 6; // por data (cada tentativa já recarrega as voltas até 4 vezes)
+const LIMITE_MS = Number(process.env.LIMITE_MIN || 40) * 60000; // tempo máximo desta parte
+// Divisão entre vários servidores do GitHub (cada um com outro endereço de internet)
 const SHARD = Number(process.env.SHARD || 0);
-const SHARDS = Number(process.env.SHARDS || 1); // manda para o app a cada 10 datas conferidas
+const SHARDS = Number(process.env.SHARDS || 1);
 if (!EXT_KEY) throw new Error('Falta o segredo EXT_KEY no GitHub (Settings > Secrets and variables > Actions).');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -32,60 +35,94 @@ async function post(path, body) {
   }
 }
 
-// Mesma leitura da extensão (roda dentro da página do Google Voos)
-async function readGoogle() {
+// ---------------------------------------------------------------- leitura (roda dentro da página)
+// Lê a lista de voos da tela atual. modo 'ida': espera as idas; modo 'volta': espera as voltas (chegam em Maringá).
+async function lerLista([modo, esperaMs]) {
   const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  if (location.hostname.includes('google.') && location.pathname.startsWith('/sorry')) return { blocked: true };
-
   const parse = (t) => {
     const price = Number((t.match(/a partir de ([\d.]+) Reais/) || [])[1]?.replace(/\./g, '')) || null;
     const direct = /Voo direto/i.test(t);
     const stops = direct ? 0 : Number((t.match(/com (\d+) parada/) || [])[1] ?? NaN);
     const airline = (t.match(/Voo (?:direto )?da (.+?)(?: com \d+ parada|\.)/) || [])[1] ?? null;
-    const m = t.match(/às (\d{2}:\d{2}) do dia ([^.]+?) e chega no aeroporto .+? às (\d{2}:\d{2}) do dia ([^.]+?)\./);
+    const m = t.match(/às (\d{2}:\d{2}) do dia ([^.]+?) e chega no aeroporto (.+?) às (\d{2}:\d{2}) do dia ([^.]+?)\./);
     const d = t.match(/Duração total: (?:(\d+)h)?\s*(?:(\d+) min)?/);
     const dur = d ? Number(d[1] ?? 0) * 60 + Number(d[2] ?? 0) : null;
     return {
       price,
       airline,
-      leg: m
-        ? { time: m[1], arr: m[3] + (m[2].trim() !== m[4].trim() ? ' (+1)' : ''), dur: dur || null, stops: Number.isFinite(stops) ? stops : null }
-        : null,
+      chega: m?.[3] ?? '',
+      leg: m ? { time: m[1], arr: m[4] + (m[2].trim() !== m[5].trim() ? ' (+1)' : ''), dur: dur || null, stops: Number.isFinite(stops) ? stops : null } : null,
     };
   };
-  const options = () =>
+  const ler = () =>
     [...document.querySelectorAll('[aria-label^="Preço total"]')]
-      .map((el) => ({ el, ...parse(el.getAttribute('aria-label')) }))
-      .filter((o) => o.price && o.leg);
+      .map((el, i) => ({ i, ...parse(el.getAttribute('aria-label')) }))
+      .filter((o) => o.price && o.leg && (modo === 'volta' ? /Maringá/i.test(o.chega) : !/Maringá/i.test(o.chega)));
 
-  // espera os resultados de ida (até 40 s: no servidor a página pode demorar)
-  let outs = options();
-  for (let i = 0; i < 40 && !outs.length; i++) {
+  const fim = Date.now() + esperaMs;
+  let lista = ler();
+  while (!lista.length && Date.now() < fim) {
     if (location.pathname.startsWith('/sorry')) return { blocked: true };
     await wait(500);
-    outs = options();
+    lista = ler();
   }
-  if (!outs.length) return { price: null, timeout: true, page: (document.title + ' | ' + (document.body?.innerText ?? '')).replace(/\s+/g, ' ').slice(0, 220) };
-  const best = outs.reduce((a, b) => (b.price < a.price ? b : a));
-  const firstText = best.el.getAttribute('aria-label');
+  if (!lista.length) return { vazio: true, tela: (document.body?.innerText ?? '').replace(/\s+/g, ' ').slice(0, 120) };
+  // espera mais um pouco para a lista terminar de carregar (o mais barato pode chegar depois)
+  await wait(1500);
+  lista = ler();
+  // o mais barato; no empate, o mais rápido e com menos escalas
+  lista.sort((a, b) => a.price - b.price || (a.leg.dur ?? 1e6) - (b.leg.dur ?? 1e6) || (a.leg.stops ?? 9) - (b.leg.stops ?? 9));
+  return { melhor: lista[0], total: lista.length };
+}
 
-  // abre a ida mais barata para ver as voltas
-  best.el.click();
-  let backs = [];
-  for (let i = 0; i < 60 && !backs.length; i++) {
-    await wait(500);
-    backs = options().filter((o) => o.el.getAttribute('aria-label') !== firstText && /Maringá/.test(o.el.getAttribute('aria-label').split('chega no aeroporto')[1] ?? ''));
+function clicar(i) {
+  const el = [...document.querySelectorAll('[aria-label^="Preço total"]')][i];
+  if (!el) return false;
+  el.scrollIntoView({ block: 'center' });
+  el.click();
+  return true;
+}
+
+// ---------------------------------------------------------------- uma data
+async function buscarData(page, p) {
+  const url = flightsUrl(p.dep, p.ret);
+  await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  let ida = await page.evaluate(lerLista, ['ida', 30000]);
+  if (ida.vazio) {
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
+    ida = await page.evaluate(lerLista, ['ida', 30000]);
   }
-  const back = backs.length ? backs.reduce((a, b) => (b.price < a.price ? b : a)) : null;
+  if (ida.blocked) return { blocked: true };
+  if (!ida.melhor) return { erro: `as idas não carregaram (${ida.tela})` };
+
+  // abre a ida mais barata: a página vai para a tela das voltas (o endereço muda)
+  const antes = page.url();
+  await page.evaluate(clicar, ida.melhor.i);
+  await page.waitForURL((u) => u.toString() !== antes, { timeout: 20000 }).catch(() => {});
+
+  // espera as voltas; se não vierem, recarrega só a tela das voltas (até 4 vezes)
+  let volta = null;
+  for (let r = 0; r < 4 && !volta?.melhor; r++) {
+    if (r > 0) {
+      await sleep(2000 + r * 2000);
+      await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+    }
+    volta = await page.evaluate(lerLista, ['volta', 25000]).catch(() => null);
+    if (volta?.blocked) return { blocked: true };
+  }
+  if (!volta?.melhor) return { erro: 'achou a ida, mas as voltas não carregaram' };
 
   return {
-    price: back ? Math.min(back.price, best.price) : best.price,
-    airline: best.airline,
-    out: best.leg,
-    back: back?.leg ?? null,
+    // o preço da tela das voltas é o total de ida e volta para essa combinação
+    price: volta.melhor.price,
+    airline: ida.melhor.airline,
+    out: ida.melhor.leg,
+    back: volta.melhor.leg,
+    link: url,
   };
 }
 
+// ---------------------------------------------------------------- rodada
 const st = { running: true, done: 0, total: 0, found: 0, error: null };
 const progress = (alert) =>
   post('/api/progress', { running: st.running, origin: 'github', shard: SHARD, shards: SHARDS, auto: true, done: st.done, total: st.total, google: st.found, sky: 0, skyOff: true, error: st.error, alert }).catch(() => {});
@@ -96,95 +133,92 @@ st.total = pairs.length;
 console.log(`Parte ${SHARD + 1} de ${SHARDS}: ${pairs.length} combinações`);
 await progress();
 
-// Chrome "de verdade" (não o modo invisível simplificado), sem imagens
 const browser = await chromium.launch({
   channel: 'chromium',
   args: ['--disable-blink-features=AutomationControlled', '--blink-settings=imagesEnabled=false'],
 });
-const ctx = await browser.newContext({
-  locale: 'pt-BR',
-  timezoneId: 'America/Sao_Paulo',
-  viewport: { width: 1280, height: 900 },
-  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-});
-await ctx.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
-
-let pend = { fares: [], checked: [], q: 0 };
-let enviando = Promise.resolve();
-const flush = (force = false) => {
-  if (!force && pend.q < LOTE) return enviando;
-  const lote = pend;
-  pend = { fares: [], checked: [], q: 0 };
-  if (!lote.q) return enviando;
-  enviando = enviando.then(() =>
-    post('/api/ingest', { source: 'github', fares: lote.fares, checked: lote.checked, queried: lote.q, note: `Robô do GitHub: ${st.done} de ${st.total} datas` }),
-  );
-  return enviando;
+const novaAba = async () => {
+  const ctx = await browser.newContext({
+    locale: 'pt-BR',
+    timezoneId: 'America/Sao_Paulo',
+    viewport: { width: 1366, height: 900 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  });
+  await ctx.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
+  return { ctx, page: await ctx.newPage() };
 };
 
-let blocked = false;
-const fila = [...pairs];
-const tentativas = new Map();
-async function trabalhador(n) {
-  const page = await ctx.newPage();
-  await sleep(n * 1500); // começa um pouco espaçado
-  while (fila.length && !blocked) {
-    const p = fila.shift();
-    const url = flightsUrl(p.dep, p.ret);
-    let result = null;
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-      result = await page.evaluate(readGoogle);
-      if (result?.timeout || (result?.price && !result.back)) {
-        // ficou preso em "Carregando resultados" ou não abriu as voltas: recarrega uma vez
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
-        const again = await page.evaluate(readGoogle);
-        if (again?.price && (again.back || !result?.price)) result = again;
-      }
-      // Sem horário da volta não serve: trata como "não carregou" e tenta de novo no fim
-      if (result?.price && !result.back) result = { timeout: true, page: 'achou a ida, mas não carregou as voltas' };
-    } catch (e) {
-      result = { timeout: true, page: e.message.split('\n')[0] };
-    }
-    await sleep(1500 + Math.random() * 1500); // ritmo de gente, não de robô
-    const k = `${p.dep}|${p.ret}`;
-    if (result?.timeout && (tentativas.get(k) ?? 0) < 2) {
-      tentativas.set(k, (tentativas.get(k) ?? 0) + 1);
-      console.log(`   … ${p.dep} → ${p.ret} não carregou, tenta de novo no fim (${result.page})`);
-      fila.push(p);
-      continue;
-    }
-    if (result?.blocked) {
-      blocked = true;
-      st.error = 'O Google pediu verificação de robô no servidor do GitHub. A próxima rodada tenta de novo.';
-      break;
-    }
-    pend.q++;
-    // só conta como "conferida" (e troca o preço antigo) quando achou preço de verdade
-    if (result?.price) pend.checked.push(p);
-    if (result?.price) {
-      st.found++;
-      pend.fares.push({ dep: p.dep, ret: p.ret, price: result.price, airline: result.airline, stops: result.out?.stops ?? null, link: url, info: { out: result.out, back: result.back } });
-    }
-    st.done++;
-    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price + '  ida ' + result.out?.time + ', volta ' + result.back?.time : 'não carregou'}`);
-    progress();
-    flush();
-  }
-  await page.close();
-}
+let pend = { fares: [], checked: [], q: 0 };
+const flush = async (force = false) => {
+  if (!force && pend.q < LOTE) return;
+  const lote = pend;
+  pend = { fares: [], checked: [], q: 0 };
+  if (lote.q) await post('/api/ingest', { source: 'github', fares: lote.fares, checked: lote.checked, queried: lote.q, note: `Robô do GitHub: ${st.done} de ${st.total} datas` });
+};
 
 const t0 = Date.now();
-try {
-  await Promise.all(Array.from({ length: PARALELO }, (_, i) => trabalhador(i)));
-} catch (e) {
-  st.error = e.message;
+const fila = pairs.map((p) => ({ ...p, tent: 0 }));
+const faltaram = [];
+let aba = await novaAba();
+let falhasSeguidas = 0;
+
+while (fila.length) {
+  if (Date.now() - t0 > LIMITE_MS) {
+    faltaram.push(...fila.splice(0));
+    break;
+  }
+  const p = fila.shift();
+  p.tent++;
+  let r;
+  try {
+    r = await buscarData(aba.page, p);
+  } catch (e) {
+    r = { erro: e.message.split('\n')[0].slice(0, 100) };
+  }
+
+  if (r.blocked) {
+    // o Google pediu verificação: espera, troca de sessão e tenta de novo depois
+    console.log(`   Google pediu verificação de robô. Esperando 1 minuto e trocando de sessão…`);
+    await aba.ctx.close().catch(() => {});
+    await sleep(60000);
+    aba = await novaAba();
+    r = { erro: 'verificação de robô' };
+  }
+
+  if (r.price) {
+    falhasSeguidas = 0;
+    st.found++;
+    st.done++;
+    pend.q++;
+    pend.checked.push({ dep: p.dep, ret: p.ret });
+    pend.fares.push({ dep: p.dep, ret: p.ret, price: r.price, airline: r.airline, stops: r.out?.stops ?? null, link: r.link, info: { out: r.out, back: r.back } });
+    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  R$ ${r.price}  ida ${r.out.time}→${r.out.arr}, volta ${r.back.time}→${r.back.arr}${p.tent > 1 ? `  (tentativa ${p.tent})` : ''}`);
+  } else {
+    falhasSeguidas++;
+    if (p.tent < MAX_TENTATIVAS) {
+      console.log(`   … ${p.dep} → ${p.ret}: ${r.erro}. Tenta de novo depois (tentativa ${p.tent} de ${MAX_TENTATIVAS})`);
+      fila.push(p);
+    } else {
+      st.done++;
+      faltaram.push(p);
+      console.log(`   ✗ ${p.dep} → ${p.ret}: não consegui depois de ${MAX_TENTATIVAS} tentativas (${r.erro})`);
+    }
+    // várias falhas seguidas: sessão nova e uma pausa maior (o Google costuma liberar depois)
+    if (falhasSeguidas >= 2) {
+      await aba.ctx.close().catch(() => {});
+      await sleep(15000 + Math.random() * 15000);
+      aba = await novaAba();
+      falhasSeguidas = 0;
+    }
+  }
+  await progress();
+  await flush();
+  await sleep(1500 + Math.random() * 2000); // ritmo de gente, não de robô
 }
+
 await flush(true);
 await browser.close();
 st.running = false;
-const problema = st.error || (st.total && st.found === 0) ? st.error || 'O robô do GitHub não encontrou nenhum preço nesta rodada.' : null;
-st.error = problema;
-await progress(problema ? { title: '⚠️ Robô do GitHub com problema', body: `${problema} Conferidas ${st.done} de ${st.total} datas.` } : null);
-console.log(`Pronto em ${Math.round((Date.now() - t0) / 1000)} s: ${st.found} preços em ${st.done} de ${st.total} datas.${problema ? ' Problema: ' + problema : ''}`);
-if (problema) process.exitCode = 1;
+if (faltaram.length) st.error = `${faltaram.length} data(s) não carregaram: ${faltaram.map((p) => `${p.dep.slice(5)}→${p.ret.slice(5)}`).join(', ')}. A próxima rodada tenta de novo.`;
+await progress(st.found === 0 && st.total ? { title: '⚠️ Robô do GitHub não achou preços', body: 'Nenhuma data carregou nesta parte da rodada. A próxima tenta de novo.' } : null);
+console.log(`Pronto em ${Math.round((Date.now() - t0) / 1000)} s: ${st.found} de ${st.total} datas com preço e volta.${faltaram.length ? ' Faltaram: ' + faltaram.map((p) => p.dep + '→' + p.ret).join(', ') : ''}`);
