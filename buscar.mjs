@@ -4,7 +4,7 @@ import { chromium } from 'playwright';
 
 const APP_URL = (process.env.APP_URL || 'https://passagens-chile.baudelaire-aviso.workers.dev').replace(/\/+$/, '');
 const EXT_KEY = process.env.EXT_KEY;
-const PARALELO = Number(process.env.PARALELO || 3); // quantas datas ao mesmo tempo
+const PARALELO = Number(process.env.PARALELO || 1); // quantas datas ao mesmo tempo
 const LOTE = 10; // manda para o app a cada 10 datas conferidas
 if (!EXT_KEY) throw new Error('Falta o segredo EXT_KEY no GitHub (Settings > Secrets and variables > Actions).');
 
@@ -57,7 +57,7 @@ async function readGoogle() {
 
   // espera os resultados de ida (até 40 s: no servidor a página pode demorar)
   let outs = options();
-  for (let i = 0; i < 80 && !outs.length; i++) {
+  for (let i = 0; i < 40 && !outs.length; i++) {
     if (location.pathname.startsWith('/sorry')) return { blocked: true };
     await wait(500);
     outs = options();
@@ -93,15 +93,18 @@ st.total = pairs.length;
 console.log(`${pairs.length} combinações, ${PARALELO} ao mesmo tempo`);
 await progress();
 
-const browser = await chromium.launch({ args: ['--disable-blink-features=AutomationControlled'] });
+// Chrome "de verdade" (não o modo invisível simplificado), sem imagens
+const browser = await chromium.launch({
+  channel: 'chromium',
+  args: ['--disable-blink-features=AutomationControlled', '--blink-settings=imagesEnabled=false'],
+});
 const ctx = await browser.newContext({
   locale: 'pt-BR',
   timezoneId: 'America/Sao_Paulo',
   viewport: { width: 1280, height: 900 },
   userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
 });
-// Não baixa imagens, fontes nem vídeos: os preços estão no texto
-await ctx.route('**/*', (route) => (['image', 'font', 'media'].includes(route.request().resourceType()) ? route.abort() : route.continue()));
+await ctx.addInitScript(() => Object.defineProperty(navigator, 'webdriver', { get: () => undefined }));
 
 let pend = { fares: [], checked: [], q: 0 };
 let enviando = Promise.resolve();
@@ -129,9 +132,15 @@ async function trabalhador(n) {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       result = await page.evaluate(readGoogle);
+      if (result?.timeout) {
+        // ficou preso em "Carregando resultados": recarrega uma vez
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+        result = await page.evaluate(readGoogle);
+      }
     } catch (e) {
       result = { timeout: true, page: e.message.split('\n')[0] };
     }
+    await sleep(1500 + Math.random() * 1500); // ritmo de gente, não de robô
     const k = `${p.dep}|${p.ret}`;
     if (result?.timeout && (tentativas.get(k) ?? 0) < 2) {
       tentativas.set(k, (tentativas.get(k) ?? 0) + 1);

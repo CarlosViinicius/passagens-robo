@@ -16,7 +16,7 @@ permissions:
 jobs:
   buscar:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,7 +25,7 @@ jobs:
           cache: npm
       - run: npm ci
       - name: Instalar o Chrome invisível
-        run: npx playwright install --with-deps --only-shell chromium
+        run: npx playwright install --with-deps chromium
       - name: Buscar no Google Voos
         run: node buscar.mjs
         env:
