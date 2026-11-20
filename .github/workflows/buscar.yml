@@ -16,7 +16,12 @@ permissions:
 jobs:
   buscar:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+    # 4 servidores ao mesmo tempo, cada um com uma parte das datas (e um endereço de internet diferente)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,6 +36,8 @@ jobs:
         env:
           EXT_KEY: ${{ secrets.EXT_KEY }}
           APP_URL: ${{ vars.APP_URL }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: 4
 
   # O GitHub desliga horários agendados depois de 60 dias sem mudanças no repositório.
   # Isto faz uma alteração vazia uma vez por mês para manter tudo ligado.

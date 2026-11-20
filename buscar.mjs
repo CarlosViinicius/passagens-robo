@@ -5,7 +5,10 @@ import { chromium } from 'playwright';
 const APP_URL = (process.env.APP_URL || 'https://passagens-chile.baudelaire-aviso.workers.dev').replace(/\/+$/, '');
 const EXT_KEY = process.env.EXT_KEY;
 const PARALELO = Number(process.env.PARALELO || 1); // quantas datas ao mesmo tempo
-const LOTE = 10; // manda para o app a cada 10 datas conferidas
+const LOTE = 5;
+// Divisão entre vários servidores do GitHub (cada um com outro endereço de internet): este faz a parte SHARD de SHARDS
+const SHARD = Number(process.env.SHARD || 0);
+const SHARDS = Number(process.env.SHARDS || 1); // manda para o app a cada 10 datas conferidas
 if (!EXT_KEY) throw new Error('Falta o segredo EXT_KEY no GitHub (Settings > Secrets and variables > Actions).');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -85,12 +88,12 @@ async function readGoogle() {
 
 const st = { running: true, done: 0, total: 0, found: 0, error: null };
 const progress = (alert) =>
-  post('/api/progress', { running: st.running, origin: 'github', auto: true, done: st.done, total: st.total, google: st.found, sky: 0, skyOff: true, error: st.error, alert }).catch(() => {});
+  post('/api/progress', { running: st.running, origin: 'github', shard: SHARD, shards: SHARDS, auto: true, done: st.done, total: st.total, google: st.found, sky: 0, skyOff: true, error: st.error, alert }).catch(() => {});
 
 const summary = await (await fetch(APP_URL + '/api/summary')).json();
-const pairs = summary.pairs.map((p) => ({ dep: p.dep, ret: p.ret }));
+const pairs = summary.pairs.map((p) => ({ dep: p.dep, ret: p.ret })).filter((_, i) => i % SHARDS === SHARD);
 st.total = pairs.length;
-console.log(`${pairs.length} combinações, ${PARALELO} ao mesmo tempo`);
+console.log(`Parte ${SHARD + 1} de ${SHARDS}: ${pairs.length} combinações`);
 await progress();
 
 // Chrome "de verdade" (não o modo invisível simplificado), sem imagens
@@ -132,11 +135,14 @@ async function trabalhador(n) {
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       result = await page.evaluate(readGoogle);
-      if (result?.timeout) {
-        // ficou preso em "Carregando resultados": recarrega uma vez
+      if (result?.timeout || (result?.price && !result.back)) {
+        // ficou preso em "Carregando resultados" ou não abriu as voltas: recarrega uma vez
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
-        result = await page.evaluate(readGoogle);
+        const again = await page.evaluate(readGoogle);
+        if (again?.price && (again.back || !result?.price)) result = again;
       }
+      // Sem horário da volta não serve: trata como "não carregou" e tenta de novo no fim
+      if (result?.price && !result.back) result = { timeout: true, page: 'achou a ida, mas não carregou as voltas' };
     } catch (e) {
       result = { timeout: true, page: e.message.split('\n')[0] };
     }
@@ -161,7 +167,7 @@ async function trabalhador(n) {
       pend.fares.push({ dep: p.dep, ret: p.ret, price: result.price, airline: result.airline, stops: result.out?.stops ?? null, link: url, info: { out: result.out, back: result.back } });
     }
     st.done++;
-    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price : 'não carregou'}${result?.back ? '' : result?.price ? ' (sem volta)' : ''}`);
+    console.log(`${String(st.done).padStart(2)} de ${st.total}  ${p.dep} → ${p.ret}  ${result?.price ? 'R$ ' + result.price + '  ida ' + result.out?.time + ', volta ' + result.back?.time : 'não carregou'}`);
     progress();
     flush();
   }
